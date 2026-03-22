@@ -7,8 +7,6 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import fs from "fs/promises";
-import path from "path";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
@@ -42,7 +40,7 @@ export interface SubprocessEvents {
   raw: (line: string) => void;
 }
 
-const DEFAULT_TIMEOUT = 900000; // 15 minutes
+const DEFAULT_TIMEOUT = 1800000; // 30 minutes — matches gateway timeoutSeconds
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -50,6 +48,9 @@ const DEFAULT_TIMEOUT = 900000; // 15 minutes
  * don't exist in Claude Code. This mapping tells the model what to use instead.
  */
 const OPENCLAW_TOOL_MAPPING_PROMPT = [
+  "## Language Requirement",
+  "CRITICAL: You MUST respond entirely in Chinese (中文). Every word of your output — including status updates, explanations, error messages, and summaries — must be in Chinese. Never output English text, internal processing notes, or English status messages. If you need to reference English terms (like tool names or code), wrap them minimally and keep all surrounding text in Chinese.",
+  "",
   "## Tool Name Mapping",
   "You are running inside Claude Code CLI, not OpenClaw. The system prompt may reference OpenClaw tool names — map them to your actual tools:",
   "",
@@ -101,6 +102,7 @@ export class ClaudeSubprocess extends EventEmitter {
     const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
+    const startTime = Date.now();
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
@@ -112,12 +114,16 @@ export class ClaudeSubprocess extends EventEmitter {
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
+        // Set timeout — SIGTERM first, then SIGKILL after 5s grace period
         this.timeoutId = setTimeout(() => {
           if (!this.isKilled) {
             this.isKilled = true;
             this.process?.kill("SIGTERM");
             this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+            // SIGKILL fallback if SIGTERM doesn't work
+            setTimeout(() => {
+              try { this.process?.kill("SIGKILL"); } catch { /* already dead */ }
+            }, 5000);
           }
         }, timeout);
 
@@ -166,10 +172,12 @@ export class ClaudeSubprocess extends EventEmitter {
         });
 
         // Handle process close
-        this.process.on("close", (code) => {
-          if (process.env.DEBUG_SUBPROCESS) {
-            console.error(`[Subprocess] Process closed with code: ${code}`);
-          }
+        this.process.on("close", (code, signal) => {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          // Always log close events for diagnostics
+          console.error(
+            `[Subprocess] pid=${this.process?.pid} closed code=${code} signal=${signal || "none"} elapsed=${elapsed}s`
+          );
           this.clearTimeout();
           // Process any remaining buffer
           if (this.buffer.trim()) {
@@ -279,6 +287,13 @@ export class ClaudeSubprocess extends EventEmitter {
       this.clearTimeout();
       this.process.kill(signal);
     }
+  }
+
+  /**
+   * Get the subprocess PID (for logging)
+   */
+  get pid(): number | undefined {
+    return this.process?.pid;
   }
 
   /**

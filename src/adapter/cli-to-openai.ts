@@ -2,46 +2,8 @@
  * Converts Claude CLI output to OpenAI-compatible response format
  */
 
-import type { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
-import type { OpenAIChatResponse, OpenAIChatChunk, OpenAIToolCall } from "../types/openai.js";
-
-/**
- * Extract text content from Claude CLI assistant message
- */
-export function extractTextContent(message: ClaudeCliAssistant): string {
-  return message.message.content
-    .filter((c) => c.type === "text")
-    .map((c) => c.text)
-    .join("\n\n");
-}
-
-/**
- * Convert Claude CLI assistant message to OpenAI streaming chunk
- */
-export function cliToOpenaiChunk(
-  message: ClaudeCliAssistant,
-  requestId: string,
-  isFirst: boolean = false
-): OpenAIChatChunk {
-  const text = extractTextContent(message);
-
-  return {
-    id: `chatcmpl-${requestId}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model: normalizeModelName(message.message.model),
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: isFirst ? "assistant" : undefined,
-          content: text,
-        },
-        finish_reason: message.message.stop_reason ? "stop" : null,
-      },
-    ],
-  };
-}
+import type { ClaudeCliResult } from "../types/claude-cli.js";
+import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
 
 /**
  * Create a final "done" chunk for streaming
@@ -67,22 +29,12 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
  */
 export function cliResultToOpenai(
   result: ClaudeCliResult,
-  requestId: string,
-  toolCalls?: OpenAIToolCall[]
+  requestId: string
 ): OpenAIChatResponse {
   // Get model from modelUsage or default
   const modelName = result.modelUsage
     ? Object.keys(result.modelUsage)[0]
-    : "claude-sonnet-4";
-
-  const message: OpenAIChatResponse["choices"][0]["message"] = {
-    role: "assistant",
-    content: result.result,
-  };
-
-  if (toolCalls && toolCalls.length > 0) {
-    message.tool_calls = toolCalls;
-  }
+    : "claude-opus-4";
 
   return {
     id: `chatcmpl-${requestId}`,
@@ -92,7 +44,10 @@ export function cliResultToOpenai(
     choices: [
       {
         index: 0,
-        message,
+        message: {
+          role: "assistant",
+          content: result.result,
+        },
         finish_reason: "stop",
       },
     ],
@@ -110,7 +65,7 @@ export function cliResultToOpenai(
  * e.g., "claude-sonnet-4-5-20250929" -> "claude-sonnet-4"
  */
 function normalizeModelName(model: string | undefined): string {
-  if (!model) return "claude-sonnet-4";
+  if (!model) return "claude-opus-4";
   if (model.includes("opus")) return "claude-opus-4";
   if (model.includes("sonnet")) return "claude-sonnet-4";
   if (model.includes("haiku")) return "claude-haiku-4";

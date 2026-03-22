@@ -10,6 +10,7 @@
 
 import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
+import { activeSubprocesses } from "./routes.js";
 
 const DEFAULT_PORT = 3456;
 
@@ -56,8 +57,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Handle graceful shutdown
+  // Handle graceful shutdown — wait for in-flight subprocesses
+  let shutdownInProgress = false;
   const shutdown = async () => {
+    if (shutdownInProgress) return;
+    shutdownInProgress = true;
+    const active = activeSubprocesses.size;
+    if (active > 0) {
+      console.log(`\nGraceful shutdown: waiting for ${active} subprocess(es) to finish (max 60s)...`);
+      const start = Date.now();
+      while (activeSubprocesses.size > 0 && Date.now() - start < 60_000) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (activeSubprocesses.size > 0) {
+        console.warn(`[Shutdown] ${activeSubprocesses.size} subprocess(es) still running after 60s, killing...`);
+        for (const sub of activeSubprocesses) {
+          sub.kill("SIGKILL");
+        }
+      }
+    }
     console.log("\nShutting down...");
     await stopServer();
     process.exit(0);

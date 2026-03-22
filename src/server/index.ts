@@ -125,6 +125,12 @@ export async function startServer(config: ServerConfig): Promise<Server> {
       }
     });
 
+    // Disable default Node.js timeouts — SSE connections can run for 30+ minutes
+    // Default requestTimeout (5min) and headersTimeout kill long-running streams
+    serverInstance.requestTimeout = 0;
+    serverInstance.headersTimeout = 0;
+    serverInstance.timeout = 0;
+
     serverInstance.listen(port, host, () => {
       console.log(`[Server] Claude Code CLI provider running at http://${host}:${port}`);
       console.log(`[Server] OpenAI-compatible endpoint: http://${host}:${port}/v1/chat/completions`);

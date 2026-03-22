@@ -1,10 +1,12 @@
 /**
  * API Route Handlers
  *
- * Implements OpenAI-compatible endpoints for Clawdbot integration
+ * Implements OpenAI-compatible endpoints for Clawdbot integration.
+ * Uses a simple concurrency limiter to prevent resource exhaustion.
  */
 
 import type { Request, Response } from "express";
+import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
@@ -12,13 +14,111 @@ import {
   cliResultToOpenai,
   createDoneChunk,
 } from "../adapter/cli-to-openai.js";
-import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
+import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+
+// ---------------------------------------------------------------------------
+// Result Cache — prevents wasted work when gateway reconnects
+// ---------------------------------------------------------------------------
+
+interface CachedResult {
+  status: "running" | "complete" | "error";
+  chunks: string[];          // accumulated SSE data lines
+  finalResult?: ClaudeCliResult;
+  errorMessage?: string;
+  subprocess?: ClaudeSubprocess;
+  createdAt: number;
+  lastModel: string;
+  requestId: string;
+}
+
+const resultCache = new Map<string, CachedResult>();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const CACHE_MAX_SIZE = 50;
+
+/** Derive a cache key from message content + model + stream mode */
+function cacheKey(body: OpenAIChatRequest): string {
+  const payload = JSON.stringify({ messages: body.messages, model: body.model, stream: !!body.stream });
+  return crypto.createHash("sha256").update(payload).digest("hex").slice(0, 20);
+}
+
+/** Evict expired entries and enforce size limit */
+function evictCache(): void {
+  const now = Date.now();
+  for (const [key, entry] of resultCache) {
+    if (now - entry.createdAt > CACHE_TTL_MS) {
+      resultCache.delete(key);
+    }
+  }
+  // If still over size, remove oldest
+  if (resultCache.size > CACHE_MAX_SIZE) {
+    const sorted = [...resultCache.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
+    for (let i = 0; i < sorted.length - CACHE_MAX_SIZE; i++) {
+      resultCache.delete(sorted[i][0]);
+    }
+  }
+}
+
+// Track all active subprocesses for graceful shutdown
+export const activeSubprocesses = new Set<ClaudeSubprocess>();
+
+// ---------------------------------------------------------------------------
+// Concurrency Control — single lane, simple and predictable
+// ---------------------------------------------------------------------------
+
+/**
+ * Counting semaphore — limits concurrent access to a shared resource.
+ * acquire() returns a promise that resolves when a slot is available.
+ */
+class Semaphore {
+  private count: number;
+  private readonly max: number;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(max: number) {
+    this.max = max;
+    this.count = max;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.count > 0) {
+      this.count--;
+      return;
+    }
+    return new Promise<void>((resolve) => this.waiting.push(resolve));
+  }
+
+  release(): void {
+    if (this.waiting.length > 0) {
+      this.waiting.shift()!();
+    } else if (this.count < this.max) {
+      this.count++;
+    }
+  }
+
+  /** Number of waiters in queue */
+  get queueLength(): number {
+    return this.waiting.length;
+  }
+
+  /** Available slots right now */
+  get available(): number {
+    return this.count;
+  }
+}
+
+// Single concurrency lane — 5 concurrent subprocesses max
+const concurrency = new Semaphore(
+  parseInt(process.env.MAX_CONCURRENCY || "5", 10)
+);
+// Max waiters before rejecting with 503
+const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "20", 10);
 
 /**
  * Handle POST /v1/chat/completions
  *
- * Main endpoint for chat requests, supports both streaming and non-streaming
+ * Main endpoint for chat requests, supports both streaming and non-streaming.
+ * Routes through quick or heavy bulkhead to prevent starvation.
  */
 export async function handleChatCompletions(
   req: Request,
@@ -41,14 +141,88 @@ export async function handleChatCompletions(
       return;
     }
 
-    // Convert to CLI input format
-    const cliInput = openaiToCli(body);
-    const subprocess = new ClaudeSubprocess();
+    // Reject if too many waiters already queued
+    if (concurrency.queueLength >= MAX_QUEUE) {
+      console.warn(`[Concurrency] Full (queue=${concurrency.queueLength}), rejecting ${requestId}`);
+      res.status(503).json({
+        error: {
+          message: "Server busy, please retry",
+          type: "server_error",
+          code: "concurrency_full",
+        },
+      });
+      return;
+    }
 
-    if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
-    } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+    // --- Cache hit check ---
+    const key = cacheKey(body);
+    const cached = resultCache.get(key);
+
+    if (cached) {
+      if (cached.status === "complete") {
+        console.log(`[Cache] HIT (complete) key=${key} for ${requestId}`);
+        if (stream) {
+          res.setHeader("Content-Type", "text/event-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.flushHeaders();
+          for (const chunk of cached.chunks) {
+            res.write(chunk);
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else if (cached.finalResult) {
+          res.json(cliResultToOpenai(cached.finalResult, requestId));
+        }
+        return;
+      }
+      if (cached.status === "running" && stream) {
+        // Reattach to running subprocess — replay buffered chunks then stream live
+        console.log(`[Cache] REATTACH (running) key=${key} for ${requestId}`);
+        await reattachToRunning(res, cached, requestId);
+        return;
+      }
+    }
+    // --- End cache check ---
+
+    if (concurrency.available === 0) {
+      console.log(`[Concurrency] Queuing request ${requestId} (waiting=${concurrency.queueLength})`);
+    }
+
+    // Wait for a slot
+    await concurrency.acquire();
+    console.log(`[Concurrency] Slot acquired for ${requestId} (available=${concurrency.available})`);
+
+    try {
+      evictCache();
+      // Convert to CLI input format
+      const cliInput = openaiToCli(body);
+      const subprocess = new ClaudeSubprocess();
+      activeSubprocesses.add(subprocess);
+
+      // Initialize cache entry
+      const cacheEntry: CachedResult = {
+        status: "running",
+        chunks: [],
+        createdAt: Date.now(),
+        lastModel: "claude-opus-4",
+        requestId,
+        subprocess,
+      };
+      resultCache.set(key, cacheEntry);
+
+      try {
+        if (stream) {
+          await handleStreamingResponse(req, res, subprocess, cliInput, requestId, cacheEntry);
+        } else {
+          await handleNonStreamingResponse(res, subprocess, cliInput, requestId, cacheEntry);
+        }
+      } finally {
+        activeSubprocesses.delete(subprocess);
+      }
+    } finally {
+      concurrency.release();
+      console.log(`[Concurrency] Slot released for ${requestId} (available=${concurrency.available})`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -66,12 +240,189 @@ export async function handleChatCompletions(
   }
 }
 
+// ---------------------------------------------------------------------------
+// English Narration Filter — prevents Claude's internal English text from
+// leaking to the chat. Works per content block: buffers the first N chars,
+// and if no CJK characters appear, suppresses the entire block.
+// ---------------------------------------------------------------------------
+
+const CJK_REGEX = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u2e80-\u2eff\u3000-\u303f\uff00-\uffef]/;
+const PROBE_LENGTH = 120; // chars to inspect before deciding
+
+// Patterns that indicate Claude's internal English narration (tool-use commentary)
+const ENGLISH_NARRATION_PATTERNS = [
+  /^I('ll| will| need to| can| should| am going| see| found| notice)/i,
+  /^Let me /i,
+  /^(Now|First|Next|Also|Finally),? (I('ll| will)|let me|let's)/i,
+  /^(Reading|Writing|Editing|Running|Searching|Looking|Checking|Creating|Using|Analyzing|Processing|Updating|Starting|Building|Compiling|Installing|Fixing|Adding) /i,
+  /^The (file|code|function|error|output|result|issue|problem|directory|module|package|config) /i,
+  /^Here('s| is| are) /i,
+  /^(Based on|According to|It (looks|seems|appears)|This (is|looks|seems|will))/i,
+  /^(Good|Great|Perfect|Done|OK|Alright)[,!.]? /i,
+];
+
+interface BlockFilter {
+  /** Characters accumulated so far for probing */
+  buffer: string;
+  /** Whether this block has been decided */
+  decided: boolean;
+  /** true = pass through (contains CJK), false = suppress (English narration) */
+  passThrough: boolean;
+}
+
+function createBlockFilter(): BlockFilter {
+  return { buffer: "", decided: false, passThrough: true };
+}
+
 /**
- * Convert Claude tool_use ID to OpenAI-compatible call ID.
- * Claude uses "toolu_abc123", OpenAI uses "call_abc123".
+ * Feed a text delta into the filter. Returns the text to forward (may be empty
+ * if suppressed, or may include buffered text on first CJK detection).
  */
-function toOpenAICallId(claudeId: string): string {
-  return `call_${claudeId.replace("toolu_", "")}`;
+function filterTextDelta(filter: BlockFilter, text: string): string {
+  // Already decided — fast path
+  if (filter.decided) {
+    return filter.passThrough ? text : "";
+  }
+
+  filter.buffer += text;
+
+  // Check if CJK appeared in buffer so far
+  if (CJK_REGEX.test(filter.buffer)) {
+    filter.decided = true;
+    filter.passThrough = true;
+    // Flush entire buffer (includes all previously held text + this delta)
+    const flushed = filter.buffer;
+    filter.buffer = "";
+    return flushed;
+  }
+
+  // Early detection: if buffer matches known English narration patterns, suppress immediately
+  if (filter.buffer.length >= 20) {
+    const trimmed = filter.buffer.trimStart();
+    for (const pattern of ENGLISH_NARRATION_PATTERNS) {
+      if (pattern.test(trimmed)) {
+        filter.decided = true;
+        filter.passThrough = false;
+        filter.buffer = "";
+        return "";
+      }
+    }
+  }
+
+  // Still probing — check if we've seen enough to decide
+  if (filter.buffer.length >= PROBE_LENGTH) {
+    // No CJK in first PROBE_LENGTH chars → suppress this block
+    filter.decided = true;
+    filter.passThrough = false;
+    filter.buffer = "";
+    return "";
+  }
+
+  // Still accumulating — hold text (don't emit yet)
+  return "";
+}
+
+/**
+ * Reattach to a running subprocess — replay buffered chunks then stream live.
+ * This handles the case where gateway dropped the SSE connection and reconnected.
+ */
+async function reattachToRunning(
+  res: Response,
+  cached: CachedResult,
+  requestId: string
+): Promise<void> {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Request-Id", requestId);
+  res.flushHeaders();
+  res.write(":reconnected\n\n");
+
+  // Replay buffered chunks
+  for (const chunk of cached.chunks) {
+    res.write(chunk);
+  }
+
+  // If already complete while we were replaying
+  if (cached.status === "complete") {
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  // Stream live from the subprocess
+  const sub = cached.subprocess;
+  if (!sub) {
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  return new Promise<void>((resolve) => {
+    let clientDisconnected = false;
+
+    const safeWrite = (data: string): boolean => {
+      if (clientDisconnected || res.writableEnded) return false;
+      try { res.write(data); return true; } catch { clientDisconnected = true; return false; }
+    };
+
+    // SSE comment keepalive every 15s
+    const heartbeat = setInterval(() => {
+      if (!clientDisconnected && !res.writableEnded) {
+        try { res.write(":heartbeat\n\n"); } catch { clientDisconnected = true; }
+      }
+    }, 15_000);
+
+    res.on("close", () => {
+      clearInterval(heartbeat);
+      clientDisconnected = true;
+      resolve();
+    });
+
+    const onDelta = (event: ClaudeCliStreamEvent) => {
+      const text = event.event?.delta?.type === "text_delta" ? event.event.delta.text : "";
+      if (text) {
+        const chunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: cached.lastModel,
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+        };
+        safeWrite(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+    };
+
+    const onResult = () => {
+      clearInterval(heartbeat);
+      if (!clientDisconnected && !res.writableEnded) {
+        safeWrite("data: [DONE]\n\n");
+        res.end();
+      }
+      cleanup();
+      resolve();
+    };
+
+    const onClose = () => {
+      clearInterval(heartbeat);
+      if (!clientDisconnected && !res.writableEnded) {
+        safeWrite("data: [DONE]\n\n");
+        res.end();
+      }
+      cleanup();
+      resolve();
+    };
+
+    const cleanup = () => {
+      sub.removeListener("content_delta", onDelta);
+      sub.removeListener("result", onResult);
+      sub.removeListener("close", onClose);
+    };
+
+    sub.on("content_delta", onDelta);
+    sub.on("result", onResult);
+    sub.on("close", onClose);
+  });
 }
 
 /**
@@ -86,7 +437,8 @@ async function handleStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
-  requestId: string
+  requestId: string,
+  cacheEntry?: CachedResult
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -103,25 +455,93 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
-    let lastModel = "claude-sonnet-4";
+    let lastModel = "claude-opus-4";
     let isComplete = false;
     let hasEmittedText = false;
-    let toolCallIndex = 0;
-    let inToolBlock = false;
+    let clientDisconnected = false;
+    let blockFilter = createBlockFilter();
 
-    // Handle actual client disconnect (response stream closed)
-    res.on("close", () => {
-      if (!isComplete) {
-        // Client disconnected before response completed - kill subprocess
-        subprocess.kill();
+    // Helper: safe write that checks both res state and client connection
+    const safeWrite = (data: string): boolean => {
+      if (clientDisconnected || res.writableEnded) return false;
+      try {
+        res.write(data);
+        return true;
+      } catch {
+        clientDisconnected = true;
+        return false;
       }
-      resolve();
+    };
+
+    // SSE keepalive — sends comment lines every 15s to keep the TCP connection
+    // alive through proxies/gateways. SSE comments (lines starting with `:`)
+    // are ignored by SSE parsers but reset proxy read timeouts.
+    const heartbeatInterval = setInterval(() => {
+      if (clientDisconnected || res.writableEnded || isComplete) return;
+      try {
+        res.write(":heartbeat\n\n");
+      } catch {
+        clientDisconnected = true;
+      }
+    }, 15_000);
+
+    const cleanup = () => {
+      clearInterval(heartbeatInterval);
+    };
+
+    // Handle actual client disconnect (response stream closed).
+    // IMPORTANT: Do NOT resolve() here — keep the concurrency slot occupied
+    // until the subprocess actually finishes. Otherwise we leak slots and can
+    // exceed MAX_CONCURRENCY with orphaned subprocesses.
+    res.on("close", () => {
+      cleanup();
+      clientDisconnected = true;
+      if (!isComplete) {
+        console.warn(
+          `[Streaming] Client disconnected while subprocess still running (pid=${subprocess.pid}). ` +
+          `Keeping concurrency slot occupied until subprocess finishes.`
+        );
+      } else {
+        // Subprocess already finished, safe to resolve
+        resolve();
+      }
     });
 
-    // When a new text content block starts after we've already emitted text,
-    // insert a separator so text from different blocks doesn't run together
+    // Flush any undecided text held in the block filter — called on block end
+    // and subprocess completion to prevent silent data loss.
+    const flushFilter = () => {
+      if (!blockFilter.decided && blockFilter.buffer.length > 0) {
+        // Undecided buffer: pass through (better to show than to lose text)
+        const text = blockFilter.buffer;
+        blockFilter.buffer = "";
+        blockFilter.decided = true;
+        blockFilter.passThrough = true;
+        if (text) {
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: lastModel,
+            choices: [{
+              index: 0,
+              delta: { content: text },
+              finish_reason: null,
+            }],
+          };
+          const sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+          safeWrite(sseData);
+          if (cacheEntry) cacheEntry.chunks.push(sseData);
+          hasEmittedText = true;
+        }
+      }
+    };
+
+    // When a new text content block starts, flush the previous filter and reset
     subprocess.on("text_block_start", () => {
-      if (hasEmittedText && !res.writableEnded) {
+      flushFilter();
+      blockFilter = createBlockFilter();
+
+      if (hasEmittedText) {
         const sepChunk = {
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
@@ -135,114 +555,68 @@ async function handleStreamingResponse(
             finish_reason: null,
           }],
         };
-        res.write(`data: ${JSON.stringify(sepChunk)}\n\n`);
+        safeWrite(`data: ${JSON.stringify(sepChunk)}\n\n`);
       }
     });
 
-    // Handle streaming content deltas
+    // Handle streaming content deltas — filtered to suppress English narration
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const delta = event.event.delta;
-      const text = (delta?.type === "text_delta" && delta.text) || "";
-      if (text && !res.writableEnded) {
-        const chunk = {
-          id: `chatcmpl-${requestId}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: lastModel,
-          choices: [{
-            index: 0,
-            delta: {
-              role: isFirst ? "assistant" : undefined,
-              content: text,
-            },
-            finish_reason: null,
-          }],
-        };
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        isFirst = false;
-        hasEmittedText = true;
-      }
+      const rawText = (delta?.type === "text_delta" && delta.text) || "";
+      if (!rawText) return;
+
+      // Run through English narration filter
+      const text = filterTextDelta(blockFilter, rawText);
+      if (!text) return; // suppressed or still probing
+
+      const chunk = {
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: lastModel,
+        choices: [{
+          index: 0,
+          delta: {
+            role: isFirst ? "assistant" : undefined,
+            content: text,
+          },
+          finish_reason: null,
+        }],
+      };
+      const sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+      safeWrite(sseData);
+      // Record in cache for reconnect replay
+      if (cacheEntry) cacheEntry.chunks.push(sseData);
+      isFirst = false;
+      hasEmittedText = true;
     });
 
-    // DISABLED: Tool call forwarding causes an agentic loop — OpenClaw interprets
-    // Claude Code's internal tool_use (Read, Bash, etc.) as calls it needs to
-    // handle, triggering repeated requests. Claude Code handles tools internally
-    // via --print mode; only the final text result should be forwarded.
-    // TODO: Re-enable with a non-tool_calls display mechanism (e.g. inline text).
-    //
-    // subprocess.on("tool_use_start", (event: ClaudeCliStreamEvent) => {
-    //   if (res.writableEnded) return;
-    //   const block = event.event.content_block;
-    //   if (block?.type !== "tool_use") return;
-    //
-    //   inToolBlock = true;
-    //   const chunk = {
-    //     id: `chatcmpl-${requestId}`,
-    //     object: "chat.completion.chunk",
-    //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
-    //     choices: [{
-    //       index: 0,
-    //       delta: {
-    //         role: isFirst ? "assistant" : undefined,
-    //         tool_calls: [{
-    //           index: toolCallIndex,
-    //           id: toOpenAICallId(block.id),
-    //           type: "function" as const,
-    //           function: {
-    //             name: block.name,
-    //             arguments: "",
-    //           },
-    //         }],
-    //       },
-    //       finish_reason: null,
-    //     }],
-    //   };
-    //   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    //   isFirst = false;
-    // });
-    //
-    // subprocess.on("input_json_delta", (event: ClaudeCliStreamEvent) => {
-    //   if (res.writableEnded) return;
-    //   const delta = event.event.delta;
-    //   if (delta?.type !== "input_json_delta") return;
-    //
-    //   const chunk = {
-    //     id: `chatcmpl-${requestId}`,
-    //     object: "chat.completion.chunk",
-    //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
-    //     choices: [{
-    //       index: 0,
-    //       delta: {
-    //         tool_calls: [{
-    //           index: toolCallIndex,
-    //           function: {
-    //             arguments: delta.partial_json,
-    //           },
-    //         }],
-    //       },
-    //       finish_reason: null,
-    //     }],
-    //   };
-    //   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    // });
-    //
-    // subprocess.on("content_block_stop", () => {
-    //   if (inToolBlock) {
-    //     toolCallIndex++;
-    //     inToolBlock = false;
-    //   }
-    // });
+    // NOTE: Tool call forwarding is disabled — Claude Code handles tools internally
+    // via --print mode. OpenClaw would misinterpret internal tool_use as external
+    // calls, causing an agentic loop.
 
     // Handle final assistant message (for model name)
     subprocess.on("assistant", (message: ClaudeCliAssistant) => {
       lastModel = message.message.model;
+      if (cacheEntry) cacheEntry.lastModel = lastModel;
+    });
+
+    // Flush filter on content block stop to release any held short text
+    subprocess.on("content_block_stop", () => {
+      flushFilter();
     });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
-      if (!res.writableEnded) {
+      flushFilter();
+      cleanup();
+      // Update cache
+      if (cacheEntry) {
+        cacheEntry.status = "complete";
+        cacheEntry.finalResult = result;
+        cacheEntry.subprocess = undefined; // release ref
+      }
+      if (!clientDisconnected && !res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
         if (result.usage) {
@@ -253,38 +627,51 @@ async function handleStreamingResponse(
               (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
           };
         }
-        res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-        res.write("data: [DONE]\n\n");
+        const doneData = `data: ${JSON.stringify(doneChunk)}\n\n`;
+        safeWrite(doneData);
+        if (cacheEntry) cacheEntry.chunks.push(doneData);
+        safeWrite("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      // Don't resolve here — wait for "close" event which always fires after
+      // "result" and represents actual subprocess termination.
     });
 
     subprocess.on("error", (error: Error) => {
+      cleanup();
       console.error("[Streaming] Error:", error.message);
-      if (!res.writableEnded) {
-        res.write(
+      if (cacheEntry) {
+        cacheEntry.status = "error";
+        cacheEntry.errorMessage = error.message;
+        cacheEntry.subprocess = undefined;
+      }
+      if (!clientDisconnected && !res.writableEnded) {
+        safeWrite(
           `data: ${JSON.stringify({
             error: { message: error.message, type: "server_error", code: null },
           })}\n\n`
         );
         res.end();
       }
-      resolve();
+      // Don't resolve here — wait for "close"
     });
 
+    // Subprocess actually terminated — this is the ONLY place we resolve the
+    // promise, which means the concurrency slot stays occupied for the entire
+    // lifetime of the subprocess, regardless of whether the client is still
+    // connected or not. This prevents resource exhaustion from orphaned procs.
     subprocess.on("close", (code: number | null) => {
-      // Subprocess exited - ensure response is closed
-      if (!res.writableEnded) {
+      cleanup();
+      if (!clientDisconnected && !res.writableEnded) {
         if (code !== 0 && !isComplete) {
-          // Abnormal exit without result - send error
-          res.write(`data: ${JSON.stringify({
+          safeWrite(`data: ${JSON.stringify({
             error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
           })}\n\n`);
         }
-        res.write("data: [DONE]\n\n");
+        safeWrite("data: [DONE]\n\n");
         res.end();
       }
+      // NOW release the concurrency slot (via finally block in handleChatCompletions)
       resolve();
     });
 
@@ -306,46 +693,58 @@ async function handleNonStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
-  requestId: string
+  requestId: string,
+  cacheEntry?: CachedResult
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
-    // DISABLED: see tool call forwarding comment in handleStreamingResponse
-    // const accumulatedToolCalls: OpenAIToolCall[] = [];
-    //
-    // subprocess.on("assistant", (message: ClaudeCliAssistant) => {
-    //   for (const block of message.message.content) {
-    //     if (block.type === "tool_use") {
-    //       accumulatedToolCalls.push({
-    //         id: toOpenAICallId(block.id),
-    //         type: "function",
-    //         function: {
-    //           name: block.name,
-    //           arguments: JSON.stringify(block.input),
-    //         },
-    //       });
-    //     }
-    //   }
-    // });
+    let clientDisconnected = false;
+
+    // Track client disconnect — subprocess keeps running, result goes to cache
+    res.on("close", () => {
+      if (!finalResult) {
+        clientDisconnected = true;
+        console.warn(
+          `[NonStreaming] Client disconnected while subprocess still running (pid=${subprocess.pid}, req=${requestId})`
+        );
+      }
+    });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
+      if (cacheEntry) {
+        cacheEntry.status = "complete";
+        cacheEntry.finalResult = result;
+        cacheEntry.subprocess = undefined;
+      }
     });
 
     subprocess.on("error", (error: Error) => {
-      console.error("[NonStreaming] Error:", error.message);
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
-      });
-      resolve();
+      console.error(`[NonStreaming] Error (pid=${subprocess.pid}, req=${requestId}):`, error.message);
+      if (cacheEntry) {
+        cacheEntry.status = "error";
+        cacheEntry.errorMessage = error.message;
+        cacheEntry.subprocess = undefined;
+      }
+      if (!clientDisconnected && !res.headersSent) {
+        res.status(500).json({
+          error: {
+            message: error.message,
+            type: "server_error",
+            code: null,
+          },
+        });
+      }
+      // Don't resolve here — wait for "close"
     });
 
     subprocess.on("close", (code: number | null) => {
-      if (finalResult) {
+      if (clientDisconnected) {
+        console.log(
+          `[NonStreaming] Subprocess finished after client disconnect (pid=${subprocess.pid}, ` +
+          `code=${code}, result=${finalResult ? "yes" : "no"})`
+        );
+      } else if (finalResult) {
         res.json(cliResultToOpenai(finalResult, requestId));
       } else if (!res.headersSent) {
         res.status(500).json({
@@ -366,13 +765,15 @@ async function handleNonStreamingResponse(
         sessionId: cliInput.sessionId,
       })
       .catch((error) => {
-        res.status(500).json({
-          error: {
-            message: error.message,
-            type: "server_error",
-            code: null,
-          },
-        });
+        if (!clientDisconnected && !res.headersSent) {
+          res.status(500).json({
+            error: {
+              message: error.message,
+              type: "server_error",
+              code: null,
+            },
+          });
+        }
         resolve();
       });
   });
@@ -415,5 +816,13 @@ export function handleHealth(_req: Request, res: Response): void {
     status: "ok",
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
+    concurrency: {
+      available: concurrency.available,
+      queued: concurrency.queueLength,
+      active: activeSubprocesses.size,
+    },
+    cache: {
+      entries: resultCache.size,
+    },
   });
 }
