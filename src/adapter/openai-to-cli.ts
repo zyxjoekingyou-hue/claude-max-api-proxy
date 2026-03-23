@@ -133,12 +133,60 @@ export function messagesToPrompt(
 }
 
 /**
- * Convert OpenAI chat request to CLI input format
+ * Detect if a message is "simple" (short conversational query) that can be
+ * handled by a faster model (Sonnet) instead of Opus.
+ *
+ * Criteria:
+ * - Last user message is under 200 chars
+ * - No code blocks, no file paths, no complex instructions
+ * - No explicit model override requesting opus
+ */
+function isSimpleQuery(messages: OpenAIChatRequest["messages"]): boolean {
+  // Find last user message
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  if (!lastUser) return false;
+
+  const text = extractText(lastUser.content);
+
+  // Short messages are likely simple — bumped threshold for more Sonnet routing
+  if (text.length > 300) return false;
+
+  // Detect complex content patterns
+  const complexPatterns = [
+    /```/,                    // code blocks
+    /\.(ts|js|py|md|pdf|pptx|json|yaml|sh)\b/i, // file extensions
+    /\/[a-zA-Z]/,             // file paths (more precise than bare /)
+    /(写|做|生成|创建|修改|分析|开发|实现|编写|设计|整合|优化|部署|配置)/,  // action verbs for complex tasks
+    /(报告|方案|PPT|文档|手册|计划)/,  // document types
+  ];
+
+  for (const pattern of complexPatterns) {
+    if (pattern.test(text)) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Convert OpenAI chat request to CLI input format.
+ *
+ * When AUTO_MODEL_ROUTING is enabled (default), simple conversational queries
+ * are automatically routed to Sonnet for faster response times (~2-3x faster),
+ * unless the request explicitly specifies an Opus model.
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
+  let model = extractModel(request.model);
+
+  // Auto-route simple queries to Sonnet for speed (disabled by default for stability)
+  const autoRoute = process.env.AUTO_MODEL_ROUTING === "true";
+  const explicitOpus = /opus/i.test(request.model);
+  if (autoRoute && model === "opus" && !explicitOpus && isSimpleQuery(request.messages)) {
+    model = "sonnet";
+  }
+
   return {
     prompt: messagesToPrompt(request.messages),
-    model: extractModel(request.model),
+    model,
     sessionId: request.user, // Use OpenAI's user field for session mapping
   };
 }

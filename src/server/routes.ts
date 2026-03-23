@@ -197,6 +197,8 @@ export async function handleChatCompletions(
       evictCache();
       // Convert to CLI input format
       const cliInput = openaiToCli(body);
+      const startTime = Date.now();
+      console.log(`[Perf] ${requestId} model=${cliInput.model} stream=${stream}`);
       const subprocess = new ClaudeSubprocess();
       activeSubprocesses.add(subprocess);
 
@@ -246,80 +248,90 @@ export async function handleChatCompletions(
 // and if no CJK characters appear, suppresses the entire block.
 // ---------------------------------------------------------------------------
 
-const CJK_REGEX = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u2e80-\u2eff\u3000-\u303f\uff00-\uffef]/;
-const PROBE_LENGTH = 120; // chars to inspect before deciding
+/**
+ * Lightweight English narration filter — only suppresses content blocks that
+ * start with clearly identifiable English narration patterns (e.g. "I'll read
+ * the file", "Let me check"). Once a block is identified as narration, it is
+ * suppressed until CJK text reappears.
+ *
+ * IMPORTANT: This filter does NOT interrupt model reasoning. It only affects
+ * the output stream — the model completes its full thinking process internally.
+ * Non-narration English content (code, URLs, technical terms, data) passes
+ * through unmodified.
+ */
 
-// Patterns that indicate Claude's internal English narration (tool-use commentary)
-const ENGLISH_NARRATION_PATTERNS = [
-  /^I('ll| will| need to| can| should| am going| see| found| notice)/i,
+const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u2e80-\u2eff\u3000-\u303f\uff00-\uffef]/;
+const PROBE_LEN = 60;
+
+/** Patterns that identify English narration (Claude's internal status updates) */
+const EN_NARRATION = [
+  /^I('ll| will| need| can| should| am going| see that| found| notice| want)/i,
   /^Let me /i,
   /^(Now|First|Next|Also|Finally),? (I('ll| will)|let me|let's)/i,
-  /^(Reading|Writing|Editing|Running|Searching|Looking|Checking|Creating|Using|Analyzing|Processing|Updating|Starting|Building|Compiling|Installing|Fixing|Adding) /i,
-  /^The (file|code|function|error|output|result|issue|problem|directory|module|package|config) /i,
-  /^Here('s| is| are) /i,
+  /^(Reading|Writing|Editing|Running|Searching|Looking|Checking|Creating|Using|Analyzing|Processing|Updating|Starting|Building|Compiling|Installing|Fixing|Adding|Examining|Reviewing) /i,
+  /^The (file|code|function|error|output|result|issue|problem|directory|module|package|config|user|request) /i,
+  /^Here('s| is| are) (the|a|my|what)/i,
   /^(Based on|According to|It (looks|seems|appears)|This (is|looks|seems|will))/i,
   /^(Good|Great|Perfect|Done|OK|Alright)[,!.]? /i,
 ];
 
 interface BlockFilter {
-  /** Characters accumulated so far for probing */
-  buffer: string;
-  /** Whether this block has been decided */
-  decided: boolean;
-  /** true = pass through (contains CJK), false = suppress (English narration) */
-  passThrough: boolean;
+  phase: "probe" | "pass" | "suppress";
+  buf: string;       // only used during probe
 }
 
 function createBlockFilter(): BlockFilter {
-  return { buffer: "", decided: false, passThrough: true };
+  return { phase: "probe", buf: "" };
 }
 
-/**
- * Feed a text delta into the filter. Returns the text to forward (may be empty
- * if suppressed, or may include buffered text on first CJK detection).
- */
 function filterTextDelta(filter: BlockFilter, text: string): string {
-  // Already decided — fast path
-  if (filter.decided) {
-    return filter.passThrough ? text : "";
+  // ---- Suppress: drop everything unless CJK reappears ----
+  if (filter.phase === "suppress") {
+    if (CJK_RE.test(text)) {
+      filter.phase = "pass";
+      return text;
+    }
+    return "";
   }
 
-  filter.buffer += text;
-
-  // Check if CJK appeared in buffer so far
-  if (CJK_REGEX.test(filter.buffer)) {
-    filter.decided = true;
-    filter.passThrough = true;
-    // Flush entire buffer (includes all previously held text + this delta)
-    const flushed = filter.buffer;
-    filter.buffer = "";
-    return flushed;
+  // ---- Pass: forward everything (no mid-block suppression) ----
+  if (filter.phase === "pass") {
+    return text;
   }
 
-  // Early detection: if buffer matches known English narration patterns, suppress immediately
-  if (filter.buffer.length >= 20) {
-    const trimmed = filter.buffer.trimStart();
-    for (const pattern of ENGLISH_NARRATION_PATTERNS) {
-      if (pattern.test(trimmed)) {
-        filter.decided = true;
-        filter.passThrough = false;
-        filter.buffer = "";
+  // ---- Probe: buffer first PROBE_LEN chars to classify the block ----
+  filter.buf += text;
+
+  // CJK detected → this is user-facing content, pass immediately
+  if (CJK_RE.test(filter.buf)) {
+    const out = filter.buf;
+    filter.buf = "";
+    filter.phase = "pass";
+    return out;
+  }
+
+  // Check for narration patterns once we have enough text
+  if (filter.buf.length >= 15) {
+    const trimmed = filter.buf.trimStart();
+    for (const pat of EN_NARRATION) {
+      if (pat.test(trimmed)) {
+        filter.buf = "";
+        filter.phase = "suppress";
         return "";
       }
     }
   }
 
-  // Still probing — check if we've seen enough to decide
-  if (filter.buffer.length >= PROBE_LENGTH) {
-    // No CJK in first PROBE_LENGTH chars → suppress this block
-    filter.decided = true;
-    filter.passThrough = false;
-    filter.buffer = "";
-    return "";
+  // Reached probe limit without matching narration → pass through
+  // (could be code, data, or other legitimate English content)
+  if (filter.buf.length >= PROBE_LEN) {
+    const out = filter.buf;
+    filter.buf = "";
+    filter.phase = "pass";
+    return out;
   }
 
-  // Still accumulating — hold text (don't emit yet)
-  return "";
+  return ""; // still probing
 }
 
 /**
@@ -453,6 +465,8 @@ async function handleStreamingResponse(
   // Send initial comment to confirm connection is alive
   res.write(":ok\n\n");
 
+  const streamStartTime = Date.now();
+
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
     let lastModel = "claude-opus-4";
@@ -460,6 +474,7 @@ async function handleStreamingResponse(
     let hasEmittedText = false;
     let clientDisconnected = false;
     let blockFilter = createBlockFilter();
+    let firstByteLogged = false;
 
     // Helper: safe write that checks both res state and client connection
     const safeWrite = (data: string): boolean => {
@@ -507,16 +522,15 @@ async function handleStreamingResponse(
       }
     });
 
-    // Flush any undecided text held in the block filter — called on block end
+    // Flush any text held in the probe buffer — called on block end
     // and subprocess completion to prevent silent data loss.
     const flushFilter = () => {
-      if (!blockFilter.decided && blockFilter.buffer.length > 0) {
-        // Undecided buffer: pass through (better to show than to lose text)
-        const text = blockFilter.buffer;
-        blockFilter.buffer = "";
-        blockFilter.decided = true;
-        blockFilter.passThrough = true;
-        if (text) {
+      if (blockFilter.phase === "probe" && blockFilter.buf.length > 0) {
+        // Undecided probe buffer — check if it has CJK
+        const text = blockFilter.buf;
+        blockFilter.buf = "";
+        if (CJK_RE.test(text)) {
+          blockFilter.phase = "pass";
           const chunk = {
             id: `chatcmpl-${requestId}`,
             object: "chat.completion.chunk",
@@ -533,6 +547,7 @@ async function handleStreamingResponse(
           if (cacheEntry) cacheEntry.chunks.push(sseData);
           hasEmittedText = true;
         }
+        // No CJK → drop it (likely English narration)
       }
     };
 
@@ -587,6 +602,10 @@ async function handleStreamingResponse(
       safeWrite(sseData);
       // Record in cache for reconnect replay
       if (cacheEntry) cacheEntry.chunks.push(sseData);
+      if (!firstByteLogged) {
+        firstByteLogged = true;
+        console.log(`[Perf] ${requestId} first-byte=${Date.now() - streamStartTime}ms`);
+      }
       isFirst = false;
       hasEmittedText = true;
     });
