@@ -114,6 +114,19 @@ const concurrency = new Semaphore(
 // Max waiters before rejecting with 503
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "20", 10);
 
+// Output truncation — kills subprocess if output exceeds this limit.
+// Prevents infinite loop output (e.g. model repeating "好了" thousands of times).
+const MAX_OUTPUT_CHARS = parseInt(process.env.MAX_OUTPUT_CHARS || "80000", 10);
+
+// Grace period before killing subprocess after client disconnects (ms).
+// Allows short completions to finish (result goes to cache), but prevents
+// long-running orphans from wasting tokens.
+const DISCONNECT_GRACE_MS = parseInt(process.env.DISCONNECT_GRACE_MS || "30000", 10);
+
+// Hard request timeout — kills subprocess if it exceeds this limit (ms).
+// Prevents runaway requests from blocking concurrency slots indefinitely.
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "600000", 10); // 10 min
+
 /**
  * Handle POST /v1/chat/completions
  *
@@ -475,6 +488,10 @@ async function handleStreamingResponse(
     let clientDisconnected = false;
     let blockFilter = createBlockFilter();
     let firstByteLogged = false;
+    let totalOutputChars = 0;
+    let outputTruncated = false;
+    let disconnectTimer: NodeJS.Timeout | null = null;
+    let requestTimer: NodeJS.Timeout | null = null;
 
     // Helper: safe write that checks both res state and client connection
     const safeWrite = (data: string): boolean => {
@@ -502,7 +519,28 @@ async function handleStreamingResponse(
 
     const cleanup = () => {
       clearInterval(heartbeatInterval);
+      if (requestTimer) { clearTimeout(requestTimer); requestTimer = null; }
     };
+
+    // Hard request timeout — prevent runaway subprocesses from blocking slots
+    requestTimer = setTimeout(() => {
+      if (!isComplete && subprocess.isRunning()) {
+        console.warn(
+          `[Timeout] Request exceeded ${REQUEST_TIMEOUT_MS / 1000}s hard limit ` +
+          `(pid=${subprocess.pid}, req=${requestId}, output=${totalOutputChars} chars). Killing.`
+        );
+        const notice = "\n\n[请求超时：已达到最大处理时间限制]";
+        const noticeChunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{ index: 0, delta: { content: notice }, finish_reason: null }],
+        };
+        safeWrite(`data: ${JSON.stringify(noticeChunk)}\n\n`);
+        subprocess.kill();
+      }
+    }, REQUEST_TIMEOUT_MS);
 
     // Handle actual client disconnect (response stream closed).
     // IMPORTANT: Do NOT resolve() here — keep the concurrency slot occupied
@@ -514,8 +552,18 @@ async function handleStreamingResponse(
       if (!isComplete) {
         console.warn(
           `[Streaming] Client disconnected while subprocess still running (pid=${subprocess.pid}). ` +
-          `Keeping concurrency slot occupied until subprocess finishes.`
+          `Will kill after ${DISCONNECT_GRACE_MS / 1000}s grace period.`
         );
+        // Start grace period — if subprocess doesn't finish in time, kill it
+        disconnectTimer = setTimeout(() => {
+          if (!isComplete && subprocess.isRunning()) {
+            console.warn(
+              `[Streaming] Grace period expired, killing subprocess (pid=${subprocess.pid}, ` +
+              `output=${totalOutputChars} chars)`
+            );
+            subprocess.kill();
+          }
+        }, DISCONNECT_GRACE_MS);
       } else {
         // Subprocess already finished, safe to resolve
         resolve();
@@ -576,9 +624,33 @@ async function handleStreamingResponse(
 
     // Handle streaming content deltas — filtered to suppress English narration
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
+      if (outputTruncated) return; // already truncated, ignore further output
+
       const delta = event.event.delta;
       const rawText = (delta?.type === "text_delta" && delta.text) || "";
       if (!rawText) return;
+
+      // Track total output for truncation protection
+      totalOutputChars += rawText.length;
+      if (totalOutputChars > MAX_OUTPUT_CHARS) {
+        outputTruncated = true;
+        console.warn(
+          `[Truncation] Output exceeded ${MAX_OUTPUT_CHARS} chars (pid=${subprocess.pid}, ` +
+          `req=${requestId}, total=${totalOutputChars}). Killing subprocess.`
+        );
+        // Send truncation notice to client
+        const notice = "\n\n[输出已截断：内容超出长度限制]";
+        const noticeChunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{ index: 0, delta: { content: notice }, finish_reason: null }],
+        };
+        safeWrite(`data: ${JSON.stringify(noticeChunk)}\n\n`);
+        subprocess.kill();
+        return;
+      }
 
       // Run through English narration filter
       const text = filterTextDelta(blockFilter, rawText);
@@ -681,6 +753,11 @@ async function handleStreamingResponse(
     // connected or not. This prevents resource exhaustion from orphaned procs.
     subprocess.on("close", (code: number | null) => {
       cleanup();
+      // Clear disconnect grace timer if set
+      if (disconnectTimer) {
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
       if (!clientDisconnected && !res.writableEnded) {
         if (code !== 0 && !isComplete) {
           safeWrite(`data: ${JSON.stringify({
@@ -690,6 +767,10 @@ async function handleStreamingResponse(
         safeWrite("data: [DONE]\n\n");
         res.end();
       }
+      console.log(
+        `[Streaming] Subprocess done (pid=${subprocess.pid}, req=${requestId}, ` +
+        `output=${totalOutputChars} chars, truncated=${outputTruncated})`
+      );
       // NOW release the concurrency slot (via finally block in handleChatCompletions)
       resolve();
     });
@@ -718,14 +799,35 @@ async function handleNonStreamingResponse(
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
     let clientDisconnected = false;
+    let disconnectTimer: NodeJS.Timeout | null = null;
 
-    // Track client disconnect — subprocess keeps running, result goes to cache
+    // Hard request timeout for non-streaming
+    const requestTimer = setTimeout(() => {
+      if (!finalResult && subprocess.isRunning()) {
+        console.warn(
+          `[Timeout] Non-streaming request exceeded ${REQUEST_TIMEOUT_MS / 1000}s hard limit ` +
+          `(pid=${subprocess.pid}, req=${requestId}). Killing.`
+        );
+        subprocess.kill();
+      }
+    }, REQUEST_TIMEOUT_MS);
+
+    // Track client disconnect — start grace period then kill subprocess
     res.on("close", () => {
       if (!finalResult) {
         clientDisconnected = true;
         console.warn(
-          `[NonStreaming] Client disconnected while subprocess still running (pid=${subprocess.pid}, req=${requestId})`
+          `[NonStreaming] Client disconnected while subprocess still running (pid=${subprocess.pid}, req=${requestId}). ` +
+          `Will kill after ${DISCONNECT_GRACE_MS / 1000}s grace period.`
         );
+        disconnectTimer = setTimeout(() => {
+          if (!finalResult && subprocess.isRunning()) {
+            console.warn(
+              `[NonStreaming] Grace period expired, killing subprocess (pid=${subprocess.pid})`
+            );
+            subprocess.kill();
+          }
+        }, DISCONNECT_GRACE_MS);
       }
     });
 
@@ -758,6 +860,11 @@ async function handleNonStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
+      clearTimeout(requestTimer);
+      if (disconnectTimer) {
+        clearTimeout(disconnectTimer);
+        disconnectTimer = null;
+      }
       if (clientDisconnected) {
         console.log(
           `[NonStreaming] Subprocess finished after client disconnect (pid=${subprocess.pid}, ` +
@@ -830,18 +937,31 @@ export function handleModels(_req: Request, res: Response): void {
  *
  * Health check endpoint
  */
+const serverStartTime = Date.now();
+
 export function handleHealth(_req: Request, res: Response): void {
+  const mem = process.memoryUsage();
   res.json({
     status: "ok",
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor((Date.now() - serverStartTime) / 1000),
     concurrency: {
       available: concurrency.available,
       queued: concurrency.queueLength,
       active: activeSubprocesses.size,
     },
+    memory: {
+      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
+      rss_mb: Math.round(mem.rss / 1024 / 1024),
+    },
     cache: {
       entries: resultCache.size,
+    },
+    limits: {
+      max_output_chars: MAX_OUTPUT_CHARS,
+      request_timeout_ms: REQUEST_TIMEOUT_MS,
+      disconnect_grace_ms: DISCONNECT_GRACE_MS,
     },
   });
 }

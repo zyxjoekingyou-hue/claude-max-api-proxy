@@ -57,6 +57,20 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Memory monitoring — log heap usage every 60s, warn if over threshold
+  const MEMORY_LOG_INTERVAL = 60_000;
+  const MEMORY_WARN_MB = parseInt(process.env.MEMORY_WARN_MB || "512", 10);
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+    const rssMB = Math.round(mem.rss / 1024 / 1024);
+    if (heapMB > MEMORY_WARN_MB) {
+      console.warn(`[Memory] WARNING: heap=${heapMB}MB rss=${rssMB}MB (threshold=${MEMORY_WARN_MB}MB) active=${activeSubprocesses.size}`);
+    } else if (process.env.DEBUG) {
+      console.log(`[Memory] heap=${heapMB}MB rss=${rssMB}MB active=${activeSubprocesses.size}`);
+    }
+  }, MEMORY_LOG_INTERVAL).unref(); // unref() so it doesn't prevent clean shutdown
+
   // Handle graceful shutdown — wait for in-flight subprocesses
   let shutdownInProgress = false;
   const shutdown = async () => {
