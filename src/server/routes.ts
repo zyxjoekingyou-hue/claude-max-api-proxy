@@ -7,6 +7,7 @@
 
 import type { Request, Response } from "express";
 import crypto from "crypto";
+import { execFile, spawn } from "child_process";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
@@ -63,6 +64,263 @@ function evictCache(): void {
 export const activeSubprocesses = new Set<ClaudeSubprocess>();
 
 // ---------------------------------------------------------------------------
+// CLI Health Tracker — detects Claude Max rate limits and service issues
+// ---------------------------------------------------------------------------
+
+/** Keywords that indicate Claude Max usage/rate limiting */
+const RATE_LIMIT_PATTERNS = [
+  /rate.?limit/i,
+  /usage.?limit/i,
+  /too many requests/i,
+  /overloaded/i,
+  /capacity/i,
+  /quota/i,
+  /exceeded/i,
+  /throttl/i,
+  /429/,
+  /limited/i,
+  /try again later/i,
+  /maximum.*usage/i,
+];
+
+interface CliOutcome {
+  timestamp: number;
+  success: boolean;
+  isRateLimit: boolean;
+  errorMessage?: string;
+  exitCode?: number | null;
+  durationMs?: number;
+}
+
+const CLI_HISTORY_SIZE = 20; // keep last 20 outcomes
+const cliOutcomes: CliOutcome[] = [];
+let lastRateLimitDetected: number | null = null;
+
+function isRateLimitError(text: string): boolean {
+  return RATE_LIMIT_PATTERNS.some((pat) => pat.test(text));
+}
+
+// ---------------------------------------------------------------------------
+// Rate Limit Notification — sends Telegram alert when rate limit is detected
+// ---------------------------------------------------------------------------
+
+const NOTIFY_TARGET = process.env.NOTIFY_TELEGRAM_TARGET || "7857161753";
+const NOTIFY_COOLDOWN_MS = 30 * 60 * 1000; // Don't spam — at most once per 30 min
+let lastNotifySent = 0;
+
+function notifyRateLimit(errorMessage?: string): void {
+  const now = Date.now();
+  if (now - lastNotifySent < NOTIFY_COOLDOWN_MS) return;
+  lastNotifySent = now;
+
+  const time = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+  const msg = [
+    "⚠️ Claude Max 用量已达限额",
+    "",
+    `时间: ${time}`,
+    errorMessage ? `错误: ${errorMessage.slice(0, 200)}` : "",
+    "",
+    "代理服务暂时无法处理新请求，需等待限额重置或切换备用账号。",
+  ].filter(Boolean).join("\n");
+
+  // Fire-and-forget — don't block request handling
+  execFile(
+    "openclaw",
+    ["message", "send", "--channel", "telegram", "--target", NOTIFY_TARGET, "-m", msg],
+    { timeout: 15000 },
+    (err) => {
+      if (err) {
+        console.error("[Notify] Failed to send rate limit alert:", err.message);
+      } else {
+        console.log("[Notify] Rate limit alert sent to Telegram");
+      }
+    }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Proactive Quota Probe — periodically tests Claude CLI availability
+// ---------------------------------------------------------------------------
+
+const PROBE_INTERVAL_MS = parseInt(process.env.PROBE_INTERVAL_MS || "300000", 10); // 5 min
+const PROBE_TIMEOUT_MS = 30_000; // 30s — if CLI can't answer "hi" in 30s, it's down
+let lastProbeResult: { timestamp: number; ok: boolean; error?: string; durationMs: number } | null = null;
+let probeTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Send a minimal prompt to Claude CLI and check if it responds.
+ * This catches quota exhaustion, auth issues, and CLI hangs that
+ * passive monitoring misses (because no user request triggers detection).
+ */
+async function probeQuota(): Promise<void> {
+  const start = Date.now();
+  try {
+    const result = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      const proc = spawn(process.env.CLAUDE_BIN || "claude", [
+        "--print",
+        "--dangerously-skip-permissions",
+        "--output-format", "text",
+        "--model", "sonnet",
+        "--max-turns", "1",
+        "-p", "说ok",
+      ], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: PROBE_TIMEOUT_MS,
+        env: Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
+        ),
+      });
+
+      let stdout = "";
+      let stderr = "";
+      proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+      const killTimer = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch { /* */ }
+        resolve({ ok: false, error: "探测超时(30s)" });
+      }, PROBE_TIMEOUT_MS);
+
+      proc.on("close", (code) => {
+        clearTimeout(killTimer);
+        if (code === 0 && stdout.trim().length > 0) {
+          resolve({ ok: true });
+        } else {
+          const errMsg = stderr.trim() || stdout.trim() || `exit code ${code}`;
+          // Check if this is a rate limit
+          if (isRateLimitError(errMsg)) {
+            resolve({ ok: false, error: `限额: ${errMsg.slice(0, 200)}` });
+          } else {
+            resolve({ ok: false, error: errMsg.slice(0, 200) });
+          }
+        }
+      });
+
+      proc.on("error", (err) => {
+        clearTimeout(killTimer);
+        resolve({ ok: false, error: err.message });
+      });
+    });
+
+    const durationMs = Date.now() - start;
+    lastProbeResult = { timestamp: Date.now(), ok: result.ok, error: result.error, durationMs };
+
+    if (!result.ok) {
+      console.error(`[Probe] Claude CLI 不可用: ${result.error} (${durationMs}ms)`);
+      // Record as failure for health tracking
+      recordCliOutcome({
+        timestamp: Date.now(),
+        success: false,
+        isRateLimit: result.error ? isRateLimitError(result.error) : false,
+        errorMessage: `[probe] ${result.error}`,
+      });
+      // Notify BOSS — the notifyRateLimit function has its own cooldown
+      notifyRateLimit(result.error || "Claude CLI 探测失败");
+    } else {
+      console.log(`[Probe] Claude CLI 正常 (${durationMs}ms)`);
+    }
+  } catch (err) {
+    const durationMs = Date.now() - start;
+    const msg = err instanceof Error ? err.message : "unknown error";
+    lastProbeResult = { timestamp: Date.now(), ok: false, error: msg, durationMs };
+    console.error(`[Probe] 探测异常: ${msg}`);
+  }
+}
+
+/** Start the periodic quota probe */
+export function startQuotaProbe(): void {
+  if (probeTimer) return;
+  // First probe after 60s (give server time to settle)
+  setTimeout(() => {
+    probeQuota();
+    probeTimer = setInterval(probeQuota, PROBE_INTERVAL_MS);
+    probeTimer.unref();
+  }, 60_000);
+  console.log(`[Probe] 限额探测已启动 (间隔=${PROBE_INTERVAL_MS / 1000}s)`);
+}
+
+/** Record a CLI subprocess outcome for health tracking */
+function recordCliOutcome(outcome: CliOutcome): void {
+  cliOutcomes.push(outcome);
+  if (cliOutcomes.length > CLI_HISTORY_SIZE) {
+    cliOutcomes.shift();
+  }
+  if (outcome.isRateLimit) {
+    lastRateLimitDetected = outcome.timestamp;
+    console.error(
+      `[RateLimit] Claude Max rate limit detected! error="${outcome.errorMessage?.slice(0, 200)}"`
+    );
+    // Immediately notify BOSS via Telegram
+    notifyRateLimit(outcome.errorMessage);
+  }
+}
+
+/** Get CLI health summary for /health endpoint */
+function getCliHealthSummary(): {
+  status: "ok" | "degraded" | "rate_limited" | "failing";
+  recent_success_rate: number;
+  last_rate_limit: string | null;
+  consecutive_failures: number;
+  last_error: string | null;
+} {
+  if (cliOutcomes.length === 0) {
+    return {
+      status: "ok",
+      recent_success_rate: 1,
+      last_rate_limit: lastRateLimitDetected
+        ? new Date(lastRateLimitDetected).toISOString()
+        : null,
+      consecutive_failures: 0,
+      last_error: null,
+    };
+  }
+
+  const successes = cliOutcomes.filter((o) => o.success).length;
+  const rate = successes / cliOutcomes.length;
+
+  // Count consecutive failures from the end
+  let consecutiveFailures = 0;
+  for (let i = cliOutcomes.length - 1; i >= 0; i--) {
+    if (!cliOutcomes[i].success) consecutiveFailures++;
+    else break;
+  }
+
+  // Check for recent rate limit (within last 30 minutes)
+  const recentRateLimit =
+    lastRateLimitDetected && Date.now() - lastRateLimitDetected < 30 * 60 * 1000;
+
+  // Find last error message
+  let lastError: string | null = null;
+  for (let i = cliOutcomes.length - 1; i >= 0; i--) {
+    if (cliOutcomes[i].errorMessage) {
+      lastError = cliOutcomes[i].errorMessage!.slice(0, 300);
+      break;
+    }
+  }
+
+  let status: "ok" | "degraded" | "rate_limited" | "failing";
+  if (recentRateLimit) {
+    status = "rate_limited";
+  } else if (consecutiveFailures >= 3) {
+    status = "failing";
+  } else if (rate < 0.7) {
+    status = "degraded";
+  } else {
+    status = "ok";
+  }
+
+  return {
+    status,
+    recent_success_rate: Math.round(rate * 100) / 100,
+    last_rate_limit: lastRateLimitDetected
+      ? new Date(lastRateLimitDetected).toISOString()
+      : null,
+    consecutive_failures: consecutiveFailures,
+    last_error: lastError,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency Control — single lane, simple and predictable
 // ---------------------------------------------------------------------------
 
@@ -109,7 +367,7 @@ class Semaphore {
 
 // Single concurrency lane — 5 concurrent subprocesses max
 const concurrency = new Semaphore(
-  parseInt(process.env.MAX_CONCURRENCY || "5", 10)
+  parseInt(process.env.MAX_CONCURRENCY || "3", 10)
 );
 // Max waiters before rejecting with 503
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "20", 10);
@@ -121,11 +379,16 @@ const MAX_OUTPUT_CHARS = parseInt(process.env.MAX_OUTPUT_CHARS || "80000", 10);
 // Grace period before killing subprocess after client disconnects (ms).
 // Allows short completions to finish (result goes to cache), but prevents
 // long-running orphans from wasting tokens.
-const DISCONNECT_GRACE_MS = parseInt(process.env.DISCONNECT_GRACE_MS || "30000", 10);
+const DISCONNECT_GRACE_MS = parseInt(process.env.DISCONNECT_GRACE_MS || "10000", 10);
 
 // Hard request timeout — kills subprocess if it exceeds this limit (ms).
 // Prevents runaway requests from blocking concurrency slots indefinitely.
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "600000", 10); // 10 min
+
+// First-byte timeout — kills subprocess if no content arrives within this window (ms).
+// Claude Opus sometimes takes 2-4 minutes to return the first byte, which causes
+// upstream gateways to timeout. This ensures we fail fast instead of hanging.
+const FIRST_BYTE_TIMEOUT_MS = parseInt(process.env.FIRST_BYTE_TIMEOUT_MS || "300000", 10); // 5 min
 
 /**
  * Handle POST /v1/chat/completions
@@ -492,6 +755,8 @@ async function handleStreamingResponse(
     let outputTruncated = false;
     let disconnectTimer: NodeJS.Timeout | null = null;
     let requestTimer: NodeJS.Timeout | null = null;
+    let firstByteTimer: NodeJS.Timeout | null = null;
+    let thinkingTimer: NodeJS.Timeout | null = null;
 
     // Helper: safe write that checks both res state and client connection
     const safeWrite = (data: string): boolean => {
@@ -520,6 +785,8 @@ async function handleStreamingResponse(
     const cleanup = () => {
       clearInterval(heartbeatInterval);
       if (requestTimer) { clearTimeout(requestTimer); requestTimer = null; }
+      if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+      if (thinkingTimer) { clearTimeout(thinkingTimer); thinkingTimer = null; }
     };
 
     // Hard request timeout — prevent runaway subprocesses from blocking slots
@@ -541,6 +808,69 @@ async function handleStreamingResponse(
         subprocess.kill();
       }
     }, REQUEST_TIMEOUT_MS);
+
+    // Thinking indicator — sends a visible "thinking" message periodically
+    // so the user knows the model is working, not stuck. First fires at 20s,
+    // then repeats every 30s until first content byte arrives.
+    const THINKING_DELAY_MS = parseInt(process.env.THINKING_DELAY_MS || "20000", 10);
+    const THINKING_REPEAT_MS = parseInt(process.env.THINKING_REPEAT_MS || "30000", 10);
+    let thinkingCount = 0;
+
+    const sendThinkingIndicator = () => {
+      if (firstByteLogged || isComplete || clientDisconnected || res.writableEnded) {
+        return;
+      }
+      thinkingCount++;
+      const elapsed = Math.round((Date.now() - streamStartTime) / 1000);
+      const thinkingText = thinkingCount === 1
+        ? "💭 思考中…"
+        : `💭 仍在思考… (${elapsed}s)`;
+      const thinkingChunk = {
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: lastModel,
+        choices: [{
+          index: 0,
+          delta: { role: "assistant", content: thinkingText },
+          finish_reason: null,
+        }],
+      };
+      const sseData = `data: ${JSON.stringify(thinkingChunk)}\n\n`;
+      safeWrite(sseData);
+      if (cacheEntry) cacheEntry.chunks.push(sseData);
+      isFirst = false;
+      hasEmittedText = true;
+      console.log(`[Thinking] Indicator #${thinkingCount} for ${requestId} (${elapsed}s elapsed)`);
+
+      // Schedule next indicator
+      thinkingTimer = setTimeout(sendThinkingIndicator, THINKING_REPEAT_MS);
+    };
+
+    thinkingTimer = setTimeout(sendThinkingIndicator, THINKING_DELAY_MS);
+
+    // First-byte timeout — if Claude CLI doesn't return any content within
+    // FIRST_BYTE_TIMEOUT_MS, kill it and return an error. This prevents the
+    // common scenario where Opus sits in extended thinking for 2-4 minutes,
+    // causing upstream gateways to timeout and the user to see "stuck".
+    firstByteTimer = setTimeout(() => {
+      if (!firstByteLogged && !isComplete && subprocess.isRunning()) {
+        console.warn(
+          `[FirstByte] No content received within ${FIRST_BYTE_TIMEOUT_MS / 1000}s ` +
+          `(pid=${subprocess.pid}, req=${requestId}). Killing subprocess.`
+        );
+        const notice = "\n\n[响应超时：模型长时间未返回内容，请重试]";
+        const noticeChunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{ index: 0, delta: { content: notice }, finish_reason: null }],
+        };
+        safeWrite(`data: ${JSON.stringify(noticeChunk)}\n\n`);
+        subprocess.kill();
+      }
+    }, FIRST_BYTE_TIMEOUT_MS);
 
     // Handle actual client disconnect (response stream closed).
     // IMPORTANT: Do NOT resolve() here — keep the concurrency slot occupied
@@ -676,6 +1006,9 @@ async function handleStreamingResponse(
       if (cacheEntry) cacheEntry.chunks.push(sseData);
       if (!firstByteLogged) {
         firstByteLogged = true;
+        // Cancel first-byte and thinking timers — we got content
+        if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+        if (thinkingTimer) { clearTimeout(thinkingTimer); thinkingTimer = null; }
         console.log(`[Perf] ${requestId} first-byte=${Date.now() - streamStartTime}ms`);
       }
       isFirst = false;
@@ -701,6 +1034,18 @@ async function handleStreamingResponse(
       isComplete = true;
       flushFilter();
       cleanup();
+
+      // Track CLI outcome for health monitoring
+      const errorText = result.is_error ? result.result : "";
+      const rateLimited = result.is_error && isRateLimitError(errorText);
+      recordCliOutcome({
+        timestamp: Date.now(),
+        success: !result.is_error,
+        isRateLimit: rateLimited,
+        errorMessage: result.is_error ? errorText : undefined,
+        durationMs: result.duration_ms,
+      });
+
       // Update cache
       if (cacheEntry) {
         cacheEntry.status = "complete";
@@ -731,6 +1076,15 @@ async function handleStreamingResponse(
     subprocess.on("error", (error: Error) => {
       cleanup();
       console.error("[Streaming] Error:", error.message);
+
+      // Track CLI outcome for health monitoring
+      recordCliOutcome({
+        timestamp: Date.now(),
+        success: false,
+        isRateLimit: isRateLimitError(error.message),
+        errorMessage: error.message,
+      });
+
       if (cacheEntry) {
         cacheEntry.status = "error";
         cacheEntry.errorMessage = error.message;
@@ -767,12 +1121,35 @@ async function handleStreamingResponse(
         safeWrite("data: [DONE]\n\n");
         res.end();
       }
+      // Track non-zero exit without result as failure
+      if (code !== 0 && !isComplete) {
+        recordCliOutcome({
+          timestamp: Date.now(),
+          success: false,
+          isRateLimit: false,
+          errorMessage: `Process exited with code ${code}`,
+          exitCode: code,
+        });
+      }
+
       console.log(
         `[Streaming] Subprocess done (pid=${subprocess.pid}, req=${requestId}, ` +
         `output=${totalOutputChars} chars, truncated=${outputTruncated})`
       );
       // NOW release the concurrency slot (via finally block in handleChatCompletions)
       resolve();
+    });
+
+    // Monitor stderr for rate limit signals that don't surface as JSON errors
+    subprocess.on("stderr", (text: string) => {
+      if (isRateLimitError(text)) {
+        recordCliOutcome({
+          timestamp: Date.now(),
+          success: false,
+          isRateLimit: true,
+          errorMessage: `[stderr] ${text.slice(0, 300)}`,
+        });
+      }
     });
 
     // Start the subprocess
@@ -833,6 +1210,18 @@ async function handleNonStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
+
+      // Track CLI outcome for health monitoring
+      const errorText = result.is_error ? result.result : "";
+      const rateLimited = result.is_error && isRateLimitError(errorText);
+      recordCliOutcome({
+        timestamp: Date.now(),
+        success: !result.is_error,
+        isRateLimit: rateLimited,
+        errorMessage: result.is_error ? errorText : undefined,
+        durationMs: result.duration_ms,
+      });
+
       if (cacheEntry) {
         cacheEntry.status = "complete";
         cacheEntry.finalResult = result;
@@ -842,6 +1231,15 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error(`[NonStreaming] Error (pid=${subprocess.pid}, req=${requestId}):`, error.message);
+
+      // Track CLI outcome for health monitoring
+      recordCliOutcome({
+        timestamp: Date.now(),
+        success: false,
+        isRateLimit: isRateLimitError(error.message),
+        errorMessage: error.message,
+      });
+
       if (cacheEntry) {
         cacheEntry.status = "error";
         cacheEntry.errorMessage = error.message;
@@ -882,6 +1280,18 @@ async function handleNonStreamingResponse(
         });
       }
       resolve();
+    });
+
+    // Monitor stderr for rate limit signals
+    subprocess.on("stderr", (text: string) => {
+      if (isRateLimitError(text)) {
+        recordCliOutcome({
+          timestamp: Date.now(),
+          success: false,
+          isRateLimit: true,
+          errorMessage: `[stderr] ${text.slice(0, 300)}`,
+        });
+      }
     });
 
     // Start the subprocess
@@ -941,11 +1351,18 @@ const serverStartTime = Date.now();
 
 export function handleHealth(_req: Request, res: Response): void {
   const mem = process.memoryUsage();
+  const cliHealth = getCliHealthSummary();
+
+  // Top-level status reflects CLI health — if CLI is rate limited or failing,
+  // the whole service is effectively down even if the proxy process is fine.
+  const overallStatus = cliHealth.status === "ok" ? "ok" : cliHealth.status;
+
   res.json({
-    status: "ok",
+    status: overallStatus,
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
     uptime_seconds: Math.floor((Date.now() - serverStartTime) / 1000),
+    cli: cliHealth,
     concurrency: {
       available: concurrency.available,
       queued: concurrency.queueLength,
@@ -962,6 +1379,16 @@ export function handleHealth(_req: Request, res: Response): void {
       max_output_chars: MAX_OUTPUT_CHARS,
       request_timeout_ms: REQUEST_TIMEOUT_MS,
       disconnect_grace_ms: DISCONNECT_GRACE_MS,
+      first_byte_timeout_ms: FIRST_BYTE_TIMEOUT_MS,
+      thinking_delay_ms: parseInt(process.env.THINKING_DELAY_MS || "20000", 10),
     },
+    probe: lastProbeResult
+      ? {
+          last_check: new Date(lastProbeResult.timestamp).toISOString(),
+          ok: lastProbeResult.ok,
+          duration_ms: lastProbeResult.durationMs,
+          error: lastProbeResult.error || null,
+        }
+      : null,
   });
 }

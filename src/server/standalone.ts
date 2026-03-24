@@ -10,7 +10,7 @@
 
 import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
-import { activeSubprocesses } from "./routes.js";
+import { activeSubprocesses, startQuotaProbe } from "./routes.js";
 
 const DEFAULT_PORT = 3456;
 
@@ -52,19 +52,31 @@ async function main(): Promise<void> {
     console.log(`    -H "Content-Type: application/json" \\`);
     console.log(`    -d '{"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hello!"}]}'`);
     console.log("\nPress Ctrl+C to stop.\n");
+
+    // Start proactive quota probe — detects Claude Max rate limits even when idle
+    startQuotaProbe();
   } catch (err) {
     console.error("Failed to start server:", err);
     process.exit(1);
   }
 
-  // Memory monitoring — log heap usage every 60s, warn if over threshold
-  const MEMORY_LOG_INTERVAL = 60_000;
+  // Memory monitoring — log heap usage every 30s, auto-kill oldest subprocess if over threshold
+  const MEMORY_LOG_INTERVAL = 30_000;
   const MEMORY_WARN_MB = parseInt(process.env.MEMORY_WARN_MB || "512", 10);
+  const MEMORY_KILL_MB = parseInt(process.env.MEMORY_KILL_MB || "800", 10);
   setInterval(() => {
     const mem = process.memoryUsage();
     const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
     const rssMB = Math.round(mem.rss / 1024 / 1024);
-    if (heapMB > MEMORY_WARN_MB) {
+    if (rssMB > MEMORY_KILL_MB && activeSubprocesses.size > 0) {
+      // Emergency: kill oldest subprocess to prevent OOM
+      const oldest = [...activeSubprocesses][0];
+      console.error(
+        `[Memory] CRITICAL: rss=${rssMB}MB > ${MEMORY_KILL_MB}MB threshold. ` +
+        `Killing oldest subprocess (pid=${oldest.pid}) to prevent OOM. active=${activeSubprocesses.size}`
+      );
+      oldest.kill("SIGKILL");
+    } else if (heapMB > MEMORY_WARN_MB) {
       console.warn(`[Memory] WARNING: heap=${heapMB}MB rss=${rssMB}MB (threshold=${MEMORY_WARN_MB}MB) active=${activeSubprocesses.size}`);
     } else if (process.env.DEBUG) {
       console.log(`[Memory] heap=${heapMB}MB rss=${rssMB}MB active=${activeSubprocesses.size}`);

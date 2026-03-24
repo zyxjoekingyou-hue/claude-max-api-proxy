@@ -128,12 +128,11 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
+        // Capture stderr — forward to 'stderr' event for rate limit detection
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            // Don't emit as error unless it's actually an error
-            // Claude CLI may write debug info to stderr
+            this.emit("stderr", errorText);
             if (process.env.DEBUG_SUBPROCESS) {
               console.error("[Subprocess stderr]:", errorText.slice(0, 200));
             }
